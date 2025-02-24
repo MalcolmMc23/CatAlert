@@ -7,139 +7,165 @@ import numpy as np
 from picamera2 import MappedArray, Picamera2
 from picamera2.devices import IMX500
 from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_detection
+import time
+import os
+import pygame
+from pygame import mixer
 
-class IMX500Detector:
-    def __init__(self, model_path="/usr/share/imx500-models/imx500_network_yolov8n_pp.rpk"):
-        self.last_detections = []
-        self.last_results = None
+class CameraDetector:
+    def __init__(self):
+        """Initialize the camera detector"""
+        self.picam2 = Picamera2()
         
-        # Initialize IMX500
-        self.imx500 = IMX500(model_path)
-        self.intrinsics = self.imx500.network_intrinsics
-        
-        if not self.intrinsics:
-            self.intrinsics = NetworkIntrinsics()
-            self.intrinsics.task = "object detection"
-        elif self.intrinsics.task != "object detection":
-            raise ValueError("Network is not an object detection task")
-
-        # Set default labels if none provided
-        if self.intrinsics.labels is None:
-            with open("assets/coco_labels.txt", "r") as f:
-                self.intrinsics.labels = f.read().splitlines()
-
-        # Set additional options
-        self.intrinsics.ignore_dash_labels = True
-        self.intrinsics.preserve_aspect_ratio = True
-        self.intrinsics.update_with_defaults()
-        
-        # Initialize camera
-        self.picam2 = Picamera2(self.imx500.camera_num)
-        
-    def start(self, show_preview=True):
-        """Start the detector"""
-        config = self.picam2.create_preview_configuration(
-            controls={"FrameRate": self.intrinsics.inference_rate}, 
-            buffer_count=12
+        # Configure camera
+        preview_config = self.picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)},
+            lores={"size": (320, 240)},
+            display="lores",
+            controls={"FrameDurationLimits": (100000, 100000)}  # 10 FPS limit
         )
+        self.picam2.configure(preview_config)
         
-        self.imx500.show_network_fw_progress_bar()
-        self.picam2.start(config, show_preview=show_preview)
+        # Load YOLO model
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        models_dir = os.path.join(current_dir, "models")
         
-        if self.intrinsics.preserve_aspect_ratio:
-            self.imx500.set_auto_aspect_ratio()
-            
-        self.picam2.pre_callback = self._draw_detections
+        weights_path = os.path.join(models_dir, "yolov3.weights")
+        config_path = os.path.join(models_dir, "yolov3.cfg")
+        names_path = os.path.join(models_dir, "coco.names")
         
+        if not all(os.path.exists(f) for f in [weights_path, config_path, names_path]):
+            raise FileNotFoundError("YOLO model files not found in models directory")
+        
+        self.model = cv2.dnn.readNet(weights_path, config_path)
+        
+        # Load class names
+        with open(names_path, "r") as f:
+            self.classes = f.read().strip().split("\n")
+        
+        # Initialize sound
+        mixer.init()
+        sound_path = os.path.join(os.path.dirname(__file__), "sounds", "alert.mp3")
+        if not os.path.exists(sound_path):
+            raise FileNotFoundError(f"Alert sound not found: {sound_path}")
+        self.alert_sound = mixer.Sound(sound_path)
+        
+        # Initialize state variables
+        self.last_detections = []
+        self._preview_window = None
+        self.sound_playing = False
+        self.last_frame_time = 0
+        self.min_frame_delay = 0.2  # 5 FPS processing
+
+    def start(self, show_preview=True):
+        """Start the camera"""
+        try:
+            self.picam2.start()
+            if show_preview:
+                window_name = "Camera Preview"
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(window_name, 640, 480)
+                self._preview_window = window_name
+        except Exception as e:
+            print(f"Error starting camera: {e}")
+            self.stop()
+            raise
+
     def stop(self):
-        """Stop the detector"""
+        """Stop the camera and cleanup"""
+        self.stop_alert()
+        if self._preview_window:
+            cv2.destroyWindow(self._preview_window)
+            self._preview_window = None
         self.picam2.stop()
-        
+        mixer.quit()
+
+    def play_alert(self):
+        """Play the alert sound if not already playing"""
+        if not self.sound_playing:
+            self.alert_sound.play(-1)
+            self.sound_playing = True
+
+    def stop_alert(self):
+        """Stop the alert sound"""
+        self.alert_sound.stop()
+        self.sound_playing = False
+
     def get_detections(self):
-        """Get the latest detections"""
-        self.last_results = self._parse_detections(self.picam2.capture_metadata())
-        return self.last_results
-    
+        """Get the latest detections from the camera"""
+        try:
+            # Limit frame rate
+            current_time = time.time()
+            if current_time - self.last_frame_time < self.min_frame_delay:
+                return self.last_detections
+            self.last_frame_time = current_time
+            
+            # Process frame
+            frame = self.picam2.capture_array()
+            if self._preview_window:
+                cv2.imshow(self._preview_window, frame)
+                cv2.waitKey(1)
+            
+            # Detect objects
+            blob = cv2.dnn.blobFromImage(
+                frame, 1/255.0, (288, 288), swapRB=True, crop=False
+            )
+            self.model.setInput(blob)
+            layer_outputs = self.model.forward(self.model.getUnconnectedOutLayersNames())
+            
+            # Process detections
+            self.last_detections = []
+            height, width = frame.shape[:2]
+            dog_detected = False
+            
+            for output in layer_outputs:
+                for detection in output:
+                    scores = detection[5:]
+                    class_id = np.argmax(scores)
+                    confidence = scores[class_id]
+                    
+                    if confidence > 0.5:
+                        # Calculate box coordinates
+                        center_x = int(detection[0] * width)
+                        center_y = int(detection[1] * height)
+                        w = int(detection[2] * width)
+                        h = int(detection[3] * height)
+                        x = int(center_x - w/2)
+                        y = int(center_y - h/2)
+                        
+                        self.last_detections.append(
+                            Detection(class_id, confidence, (x, y, w, h))
+                        )
+                        
+                        # Draw detection box
+                        if self._preview_window:
+                            color = (0, 255, 0)
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                            label = f"{self.classes[class_id]}: {confidence:.2f}"
+                            cv2.putText(frame, label, (x, y - 10),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            cv2.imshow(self._preview_window, frame)
+                        
+                        # Handle dog detection
+                        if self.classes[class_id] == "dog" and confidence > 0.8:
+                            dog_detected = True
+                            self.play_alert()
+            
+            if not dog_detected and self.sound_playing:
+                self.stop_alert()
+            
+            return self.last_detections
+            
+        except Exception as e:
+            print(f"Error in get_detections: {e}")
+            return []
+
     def get_labels(self):
         """Get the list of detection labels"""
-        labels = self.intrinsics.labels
-        if self.intrinsics.ignore_dash_labels:
-            labels = [label for label in labels if label and label != "-"]
-        return labels
-
-    def _parse_detections(self, metadata):
-        """Internal method to parse detections"""
-        bbox_normalization = self.intrinsics.bbox_normalization
-        threshold = 0.55
-        iou = 0.65
-        max_detections = 10
-
-        np_outputs = self.imx500.get_outputs(metadata, add_batch=True)
-        input_w, input_h = self.imx500.get_input_size()
-        
-        if np_outputs is None:
-            return self.last_detections
-
-        if self.intrinsics.postprocess == "nanodet":
-            boxes, scores, classes = postprocess_nanodet_detection(
-                outputs=np_outputs[0], 
-                conf=threshold, 
-                iou_thres=iou,
-                max_out_dets=max_detections
-            )[0]
-            from picamera2.devices.imx500.postprocess import scale_boxes
-            boxes = scale_boxes(boxes, 1, 1, input_h, input_w, False, False)
-        else:
-            boxes, scores, classes = np_outputs[0][0], np_outputs[1][0], np_outputs[2][0]
-            if bbox_normalization:
-                boxes = boxes / input_h
-            boxes = np.array_split(boxes, 4, axis=1)
-            boxes = zip(*boxes)
-
-        self.last_detections = [
-            Detection(box, category, score, metadata, self.imx500, self.picam2)
-            for box, score, category in zip(boxes, scores, classes)
-            if score > threshold
-        ]
-        return self.last_detections
-
-    def _draw_detections(self, request, stream="main"):
-        """Internal method to draw detections"""
-        if self.last_results is None:
-            return
-            
-        labels = self.get_labels()
-        with MappedArray(request, stream) as m:
-            for detection in self.last_results:
-                x, y, w, h = detection.box
-                label = f"{labels[int(detection.category)]} ({detection.conf:.2f})"
-
-                (text_width, text_height), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-                )
-                text_x = x + 5
-                text_y = y + 15
-
-                overlay = m.array.copy()
-                cv2.rectangle(
-                    overlay,
-                    (text_x, text_y - text_height),
-                    (text_x + text_width, text_y + baseline),
-                    (255, 255, 255),
-                    cv2.FILLED
-                )
-
-                alpha = 0.30
-                cv2.addWeighted(overlay, alpha, m.array, 1 - alpha, 0, m.array)
-                cv2.putText(
-                    m.array, label, (text_x, text_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1
-                )
-                cv2.rectangle(m.array, (x, y), (x + w, y + h), (0, 255, 0, 0), thickness=2)
+        return self.classes
 
 class Detection:
-    def __init__(self, coords, category, conf, metadata, imx500, picam2):
-        """Create a Detection object, recording the bounding box, category and confidence."""
+    def __init__(self, category, conf, box):
         self.category = category
         self.conf = conf
-        self.box = imx500.convert_inference_coords(coords, metadata, picam2)
+        self.box = box  # (x, y, w, h) in pixels

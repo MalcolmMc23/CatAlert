@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Large model files
+AI Camera Library and Code/models/yolov3.weights
+AI Camera Library and Code/models/yolov3.cfg
+
+# Temporary files
+*.log
+.DS_Store
+
